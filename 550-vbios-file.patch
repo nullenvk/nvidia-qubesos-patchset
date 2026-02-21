@@ -1,0 +1,156 @@
+--- nv-acpi.c.orig	2026-02-21 21:06:32.183293236 +0100
++++ nv-acpi.c	2026-02-21 23:46:09.227587149 +0100
+@@ -29,6 +29,14 @@
+ 
+ #include <linux/acpi.h>
+ 
++#include <linux/firmware.h>
++
++static char *NV_vbios_file = "";
++module_param(NV_vbios_file, charp, S_IWUSR | S_IRUSR);
++
++static void *cached_vbios = NULL;
++static size_t cached_vbios_sz = 0; 
++
+ #if defined(NV_LINUX_ACPI_EVENTS_SUPPORTED)
+ static NV_STATUS   nv_acpi_extract_integer (const union acpi_object *, void *, NvU32, NvU32 *);
+ static NV_STATUS   nv_acpi_extract_buffer  (const union acpi_object *, void *, NvU32, NvU32 *);
+@@ -296,6 +304,38 @@
+     }
+ }
+ 
++static void nv_acpi_init_vbios_file(void)
++{
++    const struct firmware *firmware;
++
++    nv_printf(NV_DBG_INFO,
++          "NVRM: %s: Experimental - attempting to load the VBIOS from file.\n", __FUNCTION__);
++
++    if(request_firmware(&firmware, NV_vbios_file, NULL) != 0)
++    {
++        nv_printf(NV_DBG_ERRORS,
++              "NVRM: %s: Failed to find the VBIOS file!\n", __FUNCTION__);
++
++        release_firmware(firmware);
++        return;
++    }
++
++    cached_vbios = vmalloc(firmware->size);
++    if(!cached_vbios)
++    {
++        nv_printf(NV_DBG_ERRORS,
++              "NVRM: %s: Failed to allocate memory for the VBIOS!\n", __FUNCTION__);
++        release_firmware(firmware);
++        return;
++    }
++
++    cached_vbios_sz = firmware->size;
++
++    memcpy(cached_vbios, firmware->data, firmware->size);
++
++    release_firmware(firmware);
++}
++
+ /*
+  * acpi methods init function.
+  * check if the NVIF, _DSM and WMMX methods are present in the acpi namespace.
+@@ -308,6 +348,9 @@
+         return;
+ 
+     *handlesPresent = 0;
++    
++    if(*NV_vbios_file != '\0')
++        nv_acpi_init_vbios_file();
+ 
+     NV_ACPI_WALK_NAMESPACE(ACPI_TYPE_DEVICE, ACPI_ROOT_OBJECT,
+                         ACPI_UINT32_MAX, nv_acpi_find_methods, NULL, NULL);
+@@ -336,6 +379,7 @@
+         nvpcf_nv_acpi_object = nv_install_notifier(nvpcf_device_handle, nv_acpi_nvpcf_event, NULL);
+     }
+ 
++
+     return;
+ }
+ 
+@@ -395,6 +439,11 @@
+         nvpcf_device_handle = NULL;
+         nvpcf_nv_acpi_object = NULL;
+     }
++    
++    if(cached_vbios != NULL) {
++        vfree(cached_vbios);
++        cached_vbios_sz = 0;
++    }
+ }
+ 
+ static NV_STATUS nv_acpi_extract_integer(
+@@ -901,6 +950,39 @@
+     return NV_OK;
+ }
+ 
++
++NV_STATUS NV_API_CALL nv_acpi_rom_from_file(
++    nv_state_t *nv,
++    NvU32 *pInData,
++    NvU32 *pOutData
++)
++{
++    uint32_t offset, length;
++
++    offset = pInData[0];
++    length = pInData[1];
++
++    if(cached_vbios == NULL) {
++        nv_printf(NV_DBG_ERRORS,
++              "NVRM: %s: VBIOS file is not loaded!\n", __FUNCTION__);
++
++        return NV_ERR_INVALID_ARGUMENT;
++    }
++
++
++    if(cached_vbios_sz < length + offset)
++    {
++        nv_printf(NV_DBG_ERRORS,
++              "NVRM: %s: Mismatched VBIOS size - buffer overflow!\n", __FUNCTION__);
++
++        return NV_ERR_INVALID_ARGUMENT;
++    }
++
++    memcpy(pOutData, cached_vbios + offset, length);
++
++    return NV_OK; 
++}
++
+ /*
+  * This function executes a _ROM ACPI method.
+  */
+@@ -918,6 +1000,10 @@
+     acpi_handle dev_handle  = NULL;
+     uint32_t offset, length;
+ 
++    // Patched: read ROM from file
++    if(*NV_vbios_file != '\0')
++        return nv_acpi_rom_from_file(nv, pInData, pOutData); 
++
+     if (!nv_acpi_get_device_handle(nv, &dev_handle))
+         return NV_ERR_NOT_SUPPORTED;
+ 
+@@ -1389,10 +1475,18 @@
+ void NV_API_CALL nv_acpi_methods_init(NvU32 *handlePresent)
+ {
+     *handlePresent = 0;
++    
++    if(*NV_vbios_file != '\0')
++        nv_acpi_init_vbios_file();
+ }
+ 
+ void NV_API_CALL nv_acpi_methods_uninit(void)
+ {
++    if(cached_vbios != NULL) {
++        vfree(cached_vbios);
++        cached_vbios_sz = 0;
++    }
++
+     return;
+ }
+ 
